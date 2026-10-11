@@ -135,6 +135,10 @@ before computing metrics.
 results across metrics. Metric formulas, neighborhood queries, and output keys
 are unchanged. Individual metric functions still work without a shared cache.
 The cache lasts only for one comparison and assumes its point arrays are unchanged.
+Caching is enabled by default. Add `--no-cache` to disable sharing trees and query
+results between metrics; each metric then creates its own search. For Python
+callers, use `compute_all_metrics(..., use_cache=False)`. Metric formulas and
+output keys are unchanged in either mode.
 
 Shared search work is charged to the first metric that needs it (Chamfer Distance);
 later per-metric timings exclude that reused work. Timing keys remain unchanged.

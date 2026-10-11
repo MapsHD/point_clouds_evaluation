@@ -706,7 +706,8 @@ def ms_graphsim(pc1: PointCloud, pc2: PointCloud, num_scales: int = 3,
 
 
 def compute_all_metrics(pc1: PointCloud, pc2: PointCloud, threshold: float = 0.01,
-                       include_advanced: bool = True) -> Tuple[Dict[str, float], Dict[str, float]]:
+                       include_advanced: bool = True, *,
+                       use_cache: bool = True) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
     Compute all metrics between two point clouds.
     
@@ -715,16 +716,18 @@ def compute_all_metrics(pc1: PointCloud, pc2: PointCloud, threshold: float = 0.0
         pc2: Point cloud 2 (distorted)
         threshold: Distance threshold for precision/recall
         include_advanced: Whether to compute advanced metrics (PointSSIM, PCQM, etc.)
+        use_cache: Whether to share KD-trees and k=1 query results between metrics
     
     Returns:
         Tuple of (metrics dict, timings dict) where timings contains seconds spent per metric
 
-    Trees and whole-cloud k=1 queries are shared within this call. Their cost is
-    included in the first metric that needs them; later timings exclude reused work.
+    With caching enabled, trees and whole-cloud k=1 queries are shared within
+    this call. Their cost is included in the first metric that needs them; later
+    timings exclude reused work. Otherwise, each metric creates its own search.
     """
     metrics = {}
     timings: Dict[str, float] = {}
-    search = _NearestNeighborSearch(pc1.points, pc2.points)
+    search = _NearestNeighborSearch(pc1.points, pc2.points) if use_cache else None
 
     print("Computing Chamfer Distance...")
     _t = time.perf_counter()
@@ -972,6 +975,9 @@ Examples:
   # Show per-metric execution timings
   python pointcloud_metrics.py reference.ply distorted.ply --timings
 
+  # Run without sharing KD-trees and queries between metrics
+  python pointcloud_metrics.py reference.ply distorted.ply --no-cache --timings
+
   # Include advanced metrics (requires colors/normals)
   python pointcloud_metrics.py reference.ply distorted.ply --advanced
 
@@ -1012,6 +1018,8 @@ Available Metrics:
                         help="Visualize the point clouds using Open3D")
     parser.add_argument("--timings", action="store_true",
                         help="Display per-metric execution timings")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Disable sharing KD-trees and nearest-neighbor query results between metrics")
     parser.add_argument("--output", type=str, default=None,
                         help="Output file to save metrics (JSON format)")
     
@@ -1034,7 +1042,8 @@ Available Metrics:
     # Compute metrics
     print("\n" + "="*70)
     metrics, timings = compute_all_metrics(pc1, pc2, args.threshold,
-                                           include_advanced=args.advanced)
+                                           include_advanced=args.advanced,
+                                           use_cache=not args.no_cache)
 
     # Display metrics
     display_metrics(metrics)
