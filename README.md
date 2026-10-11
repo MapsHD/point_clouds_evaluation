@@ -129,6 +129,18 @@ MS-GraphSIM (Multi-Scale Graph Similarity):
 clouds side by side in the Open3D viewer, or `--max-points` / `--voxel-size` to downsample large scans
 before computing metrics.
 
+## Shared nearest-neighbor searches
+
+`compute_all_metrics` shares two KD-trees and the exact whole-cloud `k=1` query
+results across metrics. Metric formulas, neighborhood queries, and output keys
+are unchanged. Individual metric functions still work without a shared cache.
+The cache lasts only for one comparison and assumes its point arrays are unchanged.
+
+Shared search work is charged to the first metric that needs it (Chamfer Distance);
+later per-metric timings exclude that reused work. Timing keys remain unchanged.
+The timing table is hidden by default; add `--timings` to display it. Metrics are
+computed and saved in the same way with or without this flag.
+
 ## Note
 
 Running with `--output` uncovered a bug where PSNR/YUV values (`numpy.float32`) failed `json.dump`
