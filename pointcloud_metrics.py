@@ -14,8 +14,10 @@ This script compares two point clouds and computes various metrics:
 - MS-GraphSIM (Multi-Scale Graph Similarity)
 """
 
+import time
 import numpy as np
 import argparse
+from functools import cached_property
 from pathlib import Path
 from typing import Tuple, Dict, Optional
 import sys
@@ -34,6 +36,30 @@ class PointCloud:
     
     def __len__(self):
         return len(self.points)
+
+
+class _NearestNeighborSearch:
+    """Reuse trees and exact k=1 queries while the point arrays stay unchanged."""
+
+    def __init__(self, pc1: np.ndarray, pc2: np.ndarray):
+        self.pc1 = pc1
+        self.pc2 = pc2
+
+    @cached_property
+    def tree1(self) -> cKDTree:
+        return cKDTree(self.pc1)
+
+    @cached_property
+    def tree2(self) -> cKDTree:
+        return cKDTree(self.pc2)
+
+    @cached_property
+    def pc1_to_pc2(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self.tree2.query(self.pc1, k=1)
+
+    @cached_property
+    def pc2_to_pc1(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self.tree1.query(self.pc2, k=1)
 
 
 def load_point_cloud(filepath: str, load_colors: bool = True, 
@@ -109,27 +135,26 @@ def load_point_cloud(filepath: str, load_colors: bool = True,
     return PointCloud(points, colors, normals)
 
 
-def chamfer_distance(pc1: np.ndarray, pc2: np.ndarray) -> Tuple[float, float, float]:
+def chamfer_distance(pc1: np.ndarray, pc2: np.ndarray, *,
+                     _search: Optional[_NearestNeighborSearch] = None) -> Tuple[float, float, float]:
     """
     Compute Chamfer Distance between two point clouds.
     
     Args:
         pc1: Point cloud 1, shape (N, 3)
         pc2: Point cloud 2, shape (M, 3)
+        _search: Internal search cache for these unchanged point arrays
     
     Returns:
         Tuple of (chamfer_distance, pc1_to_pc2, pc2_to_pc1)
     """
-    from scipy.spatial import cKDTree
-    
-    # Build KD-trees for efficient nearest neighbor search
-    tree1 = cKDTree(pc1)
-    tree2 = cKDTree(pc2)
+    if _search is None:
+        _search = _NearestNeighborSearch(pc1, pc2)
     
     # For each point in pc1, find distance to nearest point in pc2
-    distances_1_to_2, _ = tree2.query(pc1, k=1)
+    distances_1_to_2, _ = _search.pc1_to_pc2
     # For each point in pc2, find distance to nearest point in pc1
-    distances_2_to_1, _ = tree1.query(pc2, k=1)
+    distances_2_to_1, _ = _search.pc2_to_pc1
     
     # Chamfer distance is the mean of both directions
     cd_1_to_2 = np.mean(distances_1_to_2)
@@ -139,24 +164,24 @@ def chamfer_distance(pc1: np.ndarray, pc2: np.ndarray) -> Tuple[float, float, fl
     return chamfer_dist, cd_1_to_2, cd_2_to_1
 
 
-def hausdorff_distance(pc1: np.ndarray, pc2: np.ndarray) -> float:
+def hausdorff_distance(pc1: np.ndarray, pc2: np.ndarray, *,
+                       _search: Optional[_NearestNeighborSearch] = None) -> float:
     """
     Compute Hausdorff Distance between two point clouds.
     
     Args:
         pc1: Point cloud 1, shape (N, 3)
         pc2: Point cloud 2, shape (M, 3)
+        _search: Internal search cache for these unchanged point arrays
     
     Returns:
         Hausdorff distance
     """
-
+    if _search is None:
+        _search = _NearestNeighborSearch(pc1, pc2)
     
-    tree1 = cKDTree(pc1)
-    tree2 = cKDTree(pc2)
-    
-    distances_1_to_2, _ = tree2.query(pc1, k=1)
-    distances_2_to_1, _ = tree1.query(pc2, k=1)
+    distances_1_to_2, _ = _search.pc1_to_pc2
+    distances_2_to_1, _ = _search.pc2_to_pc1
     
     # Hausdorff distance is the maximum of the minimum distances
     hausdorff_dist = max(np.max(distances_1_to_2), np.max(distances_2_to_1))
@@ -164,7 +189,8 @@ def hausdorff_distance(pc1: np.ndarray, pc2: np.ndarray) -> float:
     return hausdorff_dist
 
 
-def precision_recall_fscore(pc1: np.ndarray, pc2: np.ndarray, threshold: float = 0.01) -> Dict[str, float]:
+def precision_recall_fscore(pc1: np.ndarray, pc2: np.ndarray, threshold: float = 0.01, *,
+                            _search: Optional[_NearestNeighborSearch] = None) -> Dict[str, float]:
     """
     Compute Precision, Recall, and F-score at a given threshold.
     
@@ -172,21 +198,20 @@ def precision_recall_fscore(pc1: np.ndarray, pc2: np.ndarray, threshold: float =
         pc1: Point cloud 1 (predicted), shape (N, 3)
         pc2: Point cloud 2 (ground truth), shape (M, 3)
         threshold: Distance threshold for considering a point as correct
+        _search: Internal search cache for these unchanged point arrays
     
     Returns:
         Dictionary with precision, recall, and f-score
     """
-    from scipy.spatial import cKDTree
-    
-    tree1 = cKDTree(pc1)
-    tree2 = cKDTree(pc2)
+    if _search is None:
+        _search = _NearestNeighborSearch(pc1, pc2)
     
     # Precision: how many predicted points are close to GT
-    distances_1_to_2, _ = tree2.query(pc1, k=1)
+    distances_1_to_2, _ = _search.pc1_to_pc2
     precision = np.mean(distances_1_to_2 < threshold)
     
     # Recall: how many GT points are close to predictions
-    distances_2_to_1, _ = tree1.query(pc2, k=1)
+    distances_2_to_1, _ = _search.pc2_to_pc1
     recall = np.mean(distances_2_to_1 < threshold)
     
     # F-score
@@ -202,7 +227,8 @@ def precision_recall_fscore(pc1: np.ndarray, pc2: np.ndarray, threshold: float =
     }
 
 
-def rmse(pc1: np.ndarray, pc2: np.ndarray) -> float:
+def rmse(pc1: np.ndarray, pc2: np.ndarray, *,
+         _search: Optional[_NearestNeighborSearch] = None) -> float:
     """
     Compute Root Mean Square Error between corresponding points.
     Assumes point clouds are aligned and have the same number of points.
@@ -210,15 +236,16 @@ def rmse(pc1: np.ndarray, pc2: np.ndarray) -> float:
     Args:
         pc1: Point cloud 1, shape (N, 3)
         pc2: Point cloud 2, shape (N, 3)
+        _search: Internal search cache for these unchanged point arrays
     
     Returns:
         RMSE value
     """
     if pc1.shape != pc2.shape:
         print("Warning: Point clouds have different shapes. Computing nearest neighbor RMSE.")
-        from scipy.spatial import cKDTree
-        tree2 = cKDTree(pc2)
-        distances, _ = tree2.query(pc1, k=1)
+        if _search is None:
+            _search = _NearestNeighborSearch(pc1, pc2)
+        distances, _ = _search.pc1_to_pc2
         return np.sqrt(np.mean(distances ** 2))
     
     return np.sqrt(np.mean(np.sum((pc1 - pc2) ** 2, axis=1)))
@@ -244,7 +271,8 @@ def rgb_to_ycbcr(rgb: np.ndarray) -> np.ndarray:
     return ycbcr
 
 
-def psnr_point_to_plane_d2(pc1: PointCloud, pc2: PointCloud, bit_depth: int = 10) -> float:
+def psnr_point_to_plane_d2(pc1: PointCloud, pc2: PointCloud, bit_depth: int = 10, *,
+                           _search: Optional[_NearestNeighborSearch] = None) -> float:
     """
     Compute Point-to-Plane PSNR MSE D2 metric.
     
@@ -254,6 +282,7 @@ def psnr_point_to_plane_d2(pc1: PointCloud, pc2: PointCloud, bit_depth: int = 10
         pc1: Reference point cloud with normals
         pc2: Distorted point cloud
         bit_depth: Bit depth for peak calculation (default: 10)
+        _search: Internal search cache for these unchanged point arrays
     
     Returns:
         PSNR MSE D2 value
@@ -261,10 +290,11 @@ def psnr_point_to_plane_d2(pc1: PointCloud, pc2: PointCloud, bit_depth: int = 10
     if pc1.normals is None:
         raise ValueError("Reference point cloud must have normals for D2 metric")
     
-    tree1 = cKDTree(pc1.points)
+    if _search is None:
+        _search = _NearestNeighborSearch(pc1.points, pc2.points)
     
     # For each point in pc2, find nearest neighbor in pc1
-    distances, indices = tree1.query(pc2.points, k=1)
+    _, indices = _search.pc2_to_pc1
     
     # Compute error vectors
     error_vectors = pc2.points - pc1.points[indices]
@@ -286,7 +316,8 @@ def psnr_point_to_plane_d2(pc1: PointCloud, pc2: PointCloud, bit_depth: int = 10
     return psnr
 
 
-def psnr_point_to_attribute_yuv(pc1: PointCloud, pc2: PointCloud) -> Dict[str, float]:
+def psnr_point_to_attribute_yuv(pc1: PointCloud, pc2: PointCloud, *,
+                               _search: Optional[_NearestNeighborSearch] = None) -> Dict[str, float]:
     """
     Compute Point-to-Attribute PSNR MSE YUV metric.
     
@@ -295,6 +326,7 @@ def psnr_point_to_attribute_yuv(pc1: PointCloud, pc2: PointCloud) -> Dict[str, f
     Args:
         pc1: Reference point cloud with colors
         pc2: Distorted point cloud with colors
+        _search: Internal search cache for these unchanged point arrays
     
     Returns:
         Dictionary with PSNR values for Y, Cb, Cr, and overall color PSNR
@@ -306,8 +338,10 @@ def psnr_point_to_attribute_yuv(pc1: PointCloud, pc2: PointCloud) -> Dict[str, f
     ycbcr1 = rgb_to_ycbcr(pc1.colors)
     ycbcr2 = rgb_to_ycbcr(pc2.colors)
     
-    tree1 = cKDTree(pc1.points)
-    tree2 = cKDTree(pc2.points)
+    if _search is None:
+        _search = _NearestNeighborSearch(pc1.points, pc2.points)
+    _, indices_1to2 = _search.pc1_to_pc2
+    _, indices_2to1 = _search.pc2_to_pc1
     
     # Compute symmetric distances for each channel
     psnr_values = {}
@@ -315,12 +349,10 @@ def psnr_point_to_attribute_yuv(pc1: PointCloud, pc2: PointCloud) -> Dict[str, f
     
     for i, channel in enumerate(['Y', 'Cb', 'Cr']):
         # pc1 to pc2
-        _, indices_1to2 = tree2.query(pc1.points, k=1)
         mse_1to2 = np.mean((ycbcr1[:, i] - ycbcr2[indices_1to2, i]) ** 2)
         psnr_1to2 = 10 * np.log10(peak ** 2 / mse_1to2) if mse_1to2 > 0 else float('inf')
         
         # pc2 to pc1
-        _, indices_2to1 = tree1.query(pc2.points, k=1)
         mse_2to1 = np.mean((ycbcr2[:, i] - ycbcr1[indices_2to1, i]) ** 2)
         psnr_2to1 = 10 * np.log10(peak ** 2 / mse_2to1) if mse_2to1 > 0 else float('inf')
         
@@ -336,7 +368,8 @@ def psnr_point_to_attribute_yuv(pc1: PointCloud, pc2: PointCloud) -> Dict[str, f
 
 
 def pointssim(pc1: PointCloud, pc2: PointCloud, k_neighbors: int = 12,
-              use_geometry: bool = True, use_color: bool = True) -> float:
+              use_geometry: bool = True, use_color: bool = True, *,
+              _search: Optional[_NearestNeighborSearch] = None) -> float:
     """
     Compute Point Cloud Structural Similarity (PointSSIM) metric.
     
@@ -348,15 +381,18 @@ def pointssim(pc1: PointCloud, pc2: PointCloud, k_neighbors: int = 12,
         k_neighbors: Number of nearest neighbors for feature extraction
         use_geometry: Whether to use geometry features
         use_color: Whether to use color features
+        _search: Internal search cache for these unchanged point arrays
     
     Returns:
         PointSSIM score (lower is better, 0 means identical)
     """
-    tree1 = cKDTree(pc1.points)
-    tree2 = cKDTree(pc2.points)
+    if _search is None:
+        _search = _NearestNeighborSearch(pc1.points, pc2.points)
+    tree1 = _search.tree1
+    tree2 = _search.tree2
     
     # Find correspondences
-    _, indices = tree1.query(pc2.points, k=1)
+    _, indices = _search.pc2_to_pc1
     
     similarity_scores = []
     epsilon = 1e-10
@@ -490,7 +526,8 @@ def _curvature(pts: np.ndarray, center: np.ndarray) -> float:
     ev = np.linalg.eigvalsh(cov)
     return float(ev[0] / ev[-1]) if ev[-1] > 1e-10 else 0.0
 
-def pcqm(pc1: PointCloud, pc2: PointCloud, k_neighbors: int = 12) -> float:
+def pcqm(pc1: PointCloud, pc2: PointCloud, k_neighbors: int = 12, *,
+         _search: Optional[_NearestNeighborSearch] = None) -> float:
     """
     Compute PCQM (Point Cloud Quality Metric).
     
@@ -500,6 +537,7 @@ def pcqm(pc1: PointCloud, pc2: PointCloud, k_neighbors: int = 12) -> float:
         pc1: Reference point cloud
         pc2: Distorted point cloud
         k_neighbors: Number of nearest neighbors
+        _search: Internal search cache for these unchanged point arrays
     
     Returns:
         PCQM score (higher is better, range [0, 1])
@@ -507,11 +545,13 @@ def pcqm(pc1: PointCloud, pc2: PointCloud, k_neighbors: int = 12) -> float:
     if pc1.colors is None or pc2.colors is None:
         warnings.warn("PCQM requires color information, using geometry only")
 
-    tree1 = cKDTree(pc1.points)
-    tree2 = cKDTree(pc2.points)
+    if _search is None:
+        _search = _NearestNeighborSearch(pc1.points, pc2.points)
+    tree1 = _search.tree1
+    tree2 = _search.tree2
 
     # Find correspondences
-    _, indices = tree1.query(pc2.points, k=1)
+    _, indices = _search.pc2_to_pc1
 
     # Compute features
     f3_values = []  # Curvature structure
@@ -572,7 +612,8 @@ def pcqm(pc1: PointCloud, pc2: PointCloud, k_neighbors: int = 12) -> float:
 
 
 def ms_graphsim(pc1: PointCloud, pc2: PointCloud, num_scales: int = 3,
-                k_neighbors: int = 20) -> float:
+                k_neighbors: int = 20, *,
+                _search: Optional[_NearestNeighborSearch] = None) -> float:
     """
     Compute Multi-Scale Graph Similarity (MS-GraphSIM) metric.
     
@@ -583,6 +624,7 @@ def ms_graphsim(pc1: PointCloud, pc2: PointCloud, num_scales: int = 3,
         pc2: Distorted point cloud with colors
         num_scales: Number of scales to use
         k_neighbors: Number of nearest neighbors
+        _search: Internal search cache for these unchanged point arrays
     
     Returns:
         MS-GraphSIM score (higher is better, range [0, 1])
@@ -594,8 +636,10 @@ def ms_graphsim(pc1: PointCloud, pc2: PointCloud, num_scales: int = 3,
     colors1 = rgb_to_ycbcr(pc1.colors)
     colors2 = rgb_to_ycbcr(pc2.colors)
     
-    tree1 = cKDTree(pc1.points)
-    tree2 = cKDTree(pc2.points)
+    if _search is None:
+        _search = _NearestNeighborSearch(pc1.points, pc2.points)
+    tree1 = _search.tree1
+    tree2 = _search.tree2
     
     # Sample keypoints (use a subset of points)
     n_keypoints = min(1000, len(pc1.points) // 10)
@@ -662,7 +706,8 @@ def ms_graphsim(pc1: PointCloud, pc2: PointCloud, num_scales: int = 3,
 
 
 def compute_all_metrics(pc1: PointCloud, pc2: PointCloud, threshold: float = 0.01,
-                       include_advanced: bool = True) -> Dict[str, float]:
+                       include_advanced: bool = True, *,
+                       use_cache: bool = True) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
     Compute all metrics between two point clouds.
     
@@ -671,78 +716,105 @@ def compute_all_metrics(pc1: PointCloud, pc2: PointCloud, threshold: float = 0.0
         pc2: Point cloud 2 (distorted)
         threshold: Distance threshold for precision/recall
         include_advanced: Whether to compute advanced metrics (PointSSIM, PCQM, etc.)
+        use_cache: Whether to share KD-trees and k=1 query results between metrics
     
     Returns:
-        Dictionary with all computed metrics
+        Tuple of (metrics dict, timings dict) where timings contains seconds spent per metric
+
+    With caching enabled, trees and whole-cloud k=1 queries are shared within
+    this call. Their cost is included in the first metric that needs them; later
+    timings exclude reused work. Otherwise, each metric creates its own search.
     """
     metrics = {}
-    
+    timings: Dict[str, float] = {}
+    search = _NearestNeighborSearch(pc1.points, pc2.points) if use_cache else None
+
     print("Computing Chamfer Distance...")
-    cd, cd_1to2, cd_2to1 = chamfer_distance(pc1.points, pc2.points)
+    _t = time.perf_counter()
+    cd, cd_1to2, cd_2to1 = chamfer_distance(pc1.points, pc2.points, _search=search)
+    timings['Chamfer Distance'] = time.perf_counter() - _t
     metrics['chamfer_distance'] = cd
     metrics['chamfer_pc1_to_pc2'] = cd_1to2
     metrics['chamfer_pc2_to_pc1'] = cd_2to1
-    
+
     print("Computing Hausdorff Distance...")
-    hd = hausdorff_distance(pc1.points, pc2.points)
+    _t = time.perf_counter()
+    hd = hausdorff_distance(pc1.points, pc2.points, _search=search)
+    timings['Hausdorff Distance'] = time.perf_counter() - _t
     metrics['hausdorff_distance'] = hd
-    
+
     print("Computing Precision, Recall, F-score...")
-    prf = precision_recall_fscore(pc1.points, pc2.points, threshold)
+    _t = time.perf_counter()
+    prf = precision_recall_fscore(pc1.points, pc2.points, threshold, _search=search)
+    timings['Precision / Recall / F-score'] = time.perf_counter() - _t
     metrics.update(prf)
-    
+
     print("Computing RMSE...")
-    rmse_val = rmse(pc1.points, pc2.points)
+    _t = time.perf_counter()
+    rmse_val = rmse(pc1.points, pc2.points, _search=search)
+    timings['RMSE'] = time.perf_counter() - _t
     metrics['rmse'] = rmse_val
-    
+
     if include_advanced:
         # Point-to-Plane D2 (requires normals)
         if pc1.normals is not None:
             try:
                 print("Computing Point-to-Plane PSNR MSE D2...")
-                psnr_d2 = psnr_point_to_plane_d2(pc1, pc2)
+                _t = time.perf_counter()
+                psnr_d2 = psnr_point_to_plane_d2(pc1, pc2, _search=search)
+                timings['PSNR MSE D2'] = time.perf_counter() - _t
                 metrics['psnr_d2'] = psnr_d2
             except Exception as e:
                 print(f"Warning: Could not compute PSNR D2: {e}")
-        
+
         # Point-to-Attribute YUV (requires colors)
         if pc1.colors is not None and pc2.colors is not None:
             try:
                 print("Computing Point-to-Attribute PSNR MSE YUV...")
-                psnr_yuv = psnr_point_to_attribute_yuv(pc1, pc2)
+                _t = time.perf_counter()
+                psnr_yuv = psnr_point_to_attribute_yuv(pc1, pc2, _search=search)
+                timings['PSNR MSE YUV'] = time.perf_counter() - _t
                 metrics.update(psnr_yuv)
             except Exception as e:
                 print(f"Warning: Could not compute PSNR YUV: {e}")
-            
+
             try:
                 print("Computing PointSSIM (Geometry)...")
-                pssim_geom = pointssim(pc1, pc2, use_geometry=True, use_color=False)
+                _t = time.perf_counter()
+                pssim_geom = pointssim(pc1, pc2, use_geometry=True, use_color=False, _search=search)
+                timings['PointSSIM (Geometry)'] = time.perf_counter() - _t
                 metrics['pointssim_geometry'] = pssim_geom
             except Exception as e:
                 print(f"Warning: Could not compute PointSSIM Geometry: {e}")
-            
+
             try:
                 print("Computing PointSSIM (Luminance)...")
-                pssim_color = pointssim(pc1, pc2, use_geometry=False, use_color=True)
+                _t = time.perf_counter()
+                pssim_color = pointssim(pc1, pc2, use_geometry=False, use_color=True, _search=search)
+                timings['PointSSIM (Luminance)'] = time.perf_counter() - _t
                 metrics['pointssim_luminance'] = pssim_color
             except Exception as e:
                 print(f"Warning: Could not compute PointSSIM Luminance: {e}")
-            
+
             try:
                 print("Computing PCQM...")
-                pcqm_score = pcqm(pc1, pc2)
+                _t = time.perf_counter()
+                pcqm_score = pcqm(pc1, pc2, _search=search)
+                timings['PCQM'] = time.perf_counter() - _t
                 metrics['pcqm'] = pcqm_score
             except Exception as e:
                 print(f"Warning: Could not compute PCQM: {e}")
-            
+
             try:
                 print("Computing MS-GraphSIM...")
-                ms_graph_score = ms_graphsim(pc1, pc2)
+                _t = time.perf_counter()
+                ms_graph_score = ms_graphsim(pc1, pc2, _search=search)
+                timings['MS-GraphSIM'] = time.perf_counter() - _t
                 metrics['ms_graphsim'] = ms_graph_score
             except Exception as e:
                 print(f"Warning: Could not compute MS-GraphSIM: {e}")
-    
-    return metrics
+
+    return metrics, timings
 
 
 def visualize_point_clouds(pc1: PointCloud, pc2: PointCloud):
@@ -858,6 +930,36 @@ def display_metrics(metrics: Dict[str, float]):
     print("="*70 + "\n")
 
 
+def display_timings(timings: Dict[str, float]):
+    """
+    Display per-metric execution timings in a formatted table.
+
+    Args:
+        timings: Dictionary of metric names and their elapsed times in seconds
+    """
+    if not timings:
+        return
+
+    total = sum(timings.values())
+
+    print("="*70)
+    print("EXECUTION TIMINGS")
+    print("="*70)
+
+    max_name_len = max(len(name) for name in timings)
+    col_width = max(max_name_len, 28)
+
+    print(f"  {'Metric':<{col_width}}  {'Time (s)':>10}  {'Share':>7}")
+    print(f"  {'-'*col_width}  {'-'*10}  {'-'*7}")
+    for name, elapsed in timings.items():
+        share = elapsed / total * 100 if total > 0 else 0.0
+        print(f"  {name:<{col_width}}  {elapsed:>10.3f}  {share:>6.1f}%")
+
+    print(f"  {'-'*col_width}  {'-'*10}  {'-'*7}")
+    print(f"  {'TOTAL':<{col_width}}  {total:>10.3f}  {'100.0%':>7}")
+    print("="*70 + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare two point clouds and compute various quality metrics",
@@ -869,6 +971,12 @@ Examples:
 
   # With visualization
   python pointcloud_metrics.py reference.ply distorted.ply --visualize
+
+  # Show per-metric execution timings
+  python pointcloud_metrics.py reference.ply distorted.ply --timings
+
+  # Run without sharing KD-trees and queries between metrics
+  python pointcloud_metrics.py reference.ply distorted.ply --no-cache --timings
 
   # Include advanced metrics (requires colors/normals)
   python pointcloud_metrics.py reference.ply distorted.ply --advanced
@@ -908,6 +1016,10 @@ Available Metrics:
                         help="Maximum number of points after random downsampling")
     parser.add_argument("--visualize", action="store_true",
                         help="Visualize the point clouds using Open3D")
+    parser.add_argument("--timings", action="store_true",
+                        help="Display per-metric execution timings")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Disable sharing KD-trees and nearest-neighbor query results between metrics")
     parser.add_argument("--output", type=str, default=None,
                         help="Output file to save metrics (JSON format)")
     
@@ -929,12 +1041,17 @@ Available Metrics:
     
     # Compute metrics
     print("\n" + "="*70)
-    metrics = compute_all_metrics(pc1, pc2, args.threshold, 
-                                  include_advanced=args.advanced)
-    
+    metrics, timings = compute_all_metrics(pc1, pc2, args.threshold,
+                                           include_advanced=args.advanced,
+                                           use_cache=not args.no_cache)
+
     # Display metrics
     display_metrics(metrics)
-    
+
+    # Display timing report
+    if args.timings:
+        display_timings(timings)
+
     # Save metrics to file if requested
     if args.output:
         import json
